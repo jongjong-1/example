@@ -79,8 +79,10 @@ TSA_CMD_RETURN = "R\n"         # 원위치
 
 # Due -> PC 한 줄 형식  ★ Due 펌웨어가 보내는 형식에 맞게 고칠 것
 #   "1.2,3.4,1500,0.25" 처럼 숫자만 있으면 → 아래 순서대로 해석 (구분자: , 공백 탭 ;)
-#   "enc:1500 cur:0.25" 처럼 이름이 붙어 있으면 → 이름(ref/out/enc/cur)으로 해석
-TSA_FIELDS = ["ref_force", "out_force", "encoder", "current"]
+#   "enc:1500 cur:0.25 volt:11.8" 처럼 이름이 붙어 있으면 → 이름(ref/out/enc/cur/volt)으로 해석
+#   사용 가능한 필드: ref_force, out_force, encoder, current, voltage
+#   (펌웨어가 전압을 5번째 값으로 보내면 "voltage" 를 추가: [..., "current", "voltage"])
+TSA_FIELDS = ["ref_force", "out_force", "encoder", "current", "voltage"]
 
 CLOSE_FORCE_DEFAULT = 5.0    # 그리퍼 오므릴 때 기본 힘 [N]
 CLOSE_FORCE_MAX     = 14.0   # 힘 명령 상한 [N]
@@ -153,6 +155,7 @@ last_ref_force = NAN
 last_out_force = NAN
 last_tsa_enc   = NAN
 last_tsa_cur   = NAN
+last_tsa_volt  = NAN
 last_ft_raw    = [NAN] * 6   # 영점 보정 전 [Fx, Fy, Fz, Tx, Ty, Tz]
 ft_offset      = [0.0] * 6   # FT Zero 버튼으로 잡은 영점
 ft_overload    = 0           # RFT 과부하 상태 바이트 (0 이면 정상)
@@ -184,7 +187,7 @@ buf_dxl_tick, buf_dxl_deg = [], []
 buf_dxl_goal_cur, buf_dxl_cur = [], []
 buf_fz = []
 buf_ft6 = []                  # (Fx, Fy, Fz, Tx, Ty, Tz) - CSV 저장용
-buf_tsa_enc, buf_tsa_cur = [], []
+buf_tsa_enc, buf_tsa_cur, buf_tsa_volt = [], [], []
 buf_ref_force, buf_out_force = [], []
 buf_lock = threading.Lock()   # 기록 스레드와 그래프가 동시에 버퍼를 건드리지 않도록
 
@@ -205,16 +208,43 @@ def can_is_up():
         return False
 
 
+def can_info():
+    """ip 명령으로 can0 설정 읽기 → {'bitrate': int, 'restart_ms': int, 'state': str}"""
+    info = {"bitrate": None, "restart_ms": None, "state": "?"}
+    try:
+        out = subprocess.run(["ip", "-details", "link", "show", CAN_CHANNEL],
+                             capture_output=True, text=True, timeout=1).stdout
+    except Exception:
+        return info
+    words = out.split()
+    for i, w in enumerate(words[:-1]):
+        if w == "bitrate" and words[i + 1].isdigit():
+            info["bitrate"] = int(words[i + 1])
+        elif w == "restart-ms" and words[i + 1].isdigit():
+            info["restart_ms"] = int(words[i + 1])
+        elif w == "state" and i > 0 and words[i - 1] == "can":
+            info["state"] = words[i + 1]
+    return info
+
+
 def can_setup():
     """can0 를 켜고 Bus 를 연다. 실패해도 프로그램은 계속 (다이나믹셀만이라도 쓰도록)"""
     if not os.path.exists(f"/sys/class/net/{CAN_CHANNEL}"):
         print(f"[CAN] {CAN_CHANNEL} 가 없습니다. PCAN-USB 연결 / 드라이버(peak_usb) 확인")
         return None
 
-    if can_is_up():
-        # 이미 켜져 있으면 sudo 없이 그대로 사용
-        print(f"[CAN] 이미 켜져 있는 {CAN_CHANNEL} 를 사용합니다.")
+    info = can_info()
+    # 이미 켜져 있어도 bitrate 가 다르거나, restart-ms 0 (BUS-OFF 되면 영원히 멈춤) 이면 다시 설정
+    settings_ok = info["bitrate"] == CAN_BITRATE and info["restart_ms"] not in (None, 0) \
+        and info["state"] != "BUS-OFF"
+    if can_is_up() and settings_ok:
+        # 설정이 맞으면 sudo 없이 그대로 사용
+        print(f"[CAN] 이미 켜져 있는 {CAN_CHANNEL} 를 사용합니다 "
+              f"({info['bitrate']} bps, state {info['state']}).")
     else:
+        if can_is_up():
+            print(f"[CAN] {CAN_CHANNEL} 설정이 맞지 않아 다시 설정합니다 "
+                  f"(bitrate {info['bitrate']}, restart-ms {info['restart_ms']}, state {info['state']})")
         try:
             cmd(f"sudo ip link set {CAN_CHANNEL} down")
             # restart-ms 100 : BUS-OFF 가 되어도 0.1 s 뒤 자동 복구 (없으면 영원히 멈춤)
@@ -222,6 +252,11 @@ def can_setup():
             cmd(f"sudo ip link set {CAN_CHANNEL} up")
             print(f"[CAN] {CAN_CHANNEL} 켬 ({CAN_BITRATE} bps)")
         except subprocess.CalledProcessError:
+            if can_is_up():
+                print(f"[CAN] sudo 실패 → 현재 설정 그대로 사용 (FT 통신이 안 되면 아래 명령 실행)\n"
+                      f"      sudo ip link set {CAN_CHANNEL} down && sudo ip link set {CAN_CHANNEL} "
+                      f"up type can bitrate {CAN_BITRATE} restart-ms 100")
+                return can.interface.Bus(channel=CAN_CHANNEL, interface='socketcan')
             print(f"""
 [CAN] {CAN_CHANNEL} 를 켤 수 없습니다 (sudo 실패). FT 센서 없이 계속합니다.
   일반 터미널에서 아래 명령으로 CAN 을 먼저 켠 뒤 다시 실행하세요.
@@ -350,7 +385,8 @@ tsa_line_count = 0
 _TSA_PAIR = re.compile(r'([A-Za-z_]+)\s*[:=]\s*(-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)')
 _TSA_NUM = re.compile(r'-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?')
 _TSA_KEYS = [("ref", "ref_force"), ("out", "out_force"), ("enc", "encoder"),
-             ("pos", "encoder"), ("cur", "current"), ("amp", "current")]
+             ("pos", "encoder"), ("cur", "current"), ("amp", "current"),
+             ("vol", "voltage")]
 
 
 def find_tsa_port():
@@ -410,6 +446,9 @@ def parse_tsa_line(line):
         out = {}
         for key, val in pairs:
             key = key.lower()
+            if key == "v" and "voltage" not in out:      # "V:11.8"
+                out["voltage"] = float(val)
+                continue
             for prefix, field in _TSA_KEYS:
                 if key.startswith(prefix) and field not in out:
                     out[field] = float(val)
@@ -420,7 +459,7 @@ def parse_tsa_line(line):
 
 
 def tsa_rx_thread():
-    global last_ref_force, last_out_force, last_tsa_enc, last_tsa_cur
+    global last_ref_force, last_out_force, last_tsa_enc, last_tsa_cur, last_tsa_volt
     global last_tsa_time, tsa_last_line, tsa_line_count
 
     while running:
@@ -446,6 +485,7 @@ def tsa_rx_thread():
         last_out_force = values.get("out_force", last_out_force)
         last_tsa_enc = values.get("encoder", last_tsa_enc)
         last_tsa_cur = values.get("current", last_tsa_cur)
+        last_tsa_volt = values.get("voltage", last_tsa_volt)
         last_tsa_time = time.time()
 
 
@@ -900,6 +940,7 @@ def logger_thread():
                 buf_ft6.append(ft)
                 buf_tsa_enc.append(last_tsa_enc)
                 buf_tsa_cur.append(last_tsa_cur)
+                buf_tsa_volt.append(last_tsa_volt)
                 buf_ref_force.append(last_ref_force)
                 buf_out_force.append(last_out_force)
 
@@ -922,10 +963,11 @@ def save_csv():
         w.writerow(["time_s", "phase", "dxl_tick", "dxl_deg",
                     "dxl_goal_current_mA", "dxl_current_mA",
                     "ft_fx_N", "ft_fy_N", "ft_fz_N", "ft_tx_Nm", "ft_ty_Nm", "ft_tz_Nm",
-                    "tsa_encoder", "tsa_current_A", "tsa_ref_force_N", "tsa_out_force_N"])
+                    "tsa_encoder", "tsa_current_A", "tsa_voltage_V",
+                    "tsa_ref_force_N", "tsa_out_force_N"])
         for row in zip(buf_t, buf_phase, buf_dxl_tick, buf_dxl_deg,
                        buf_dxl_goal_cur, buf_dxl_cur, buf_ft6,
-                       buf_tsa_enc, buf_tsa_cur, buf_ref_force, buf_out_force):
+                       buf_tsa_enc, buf_tsa_cur, buf_tsa_volt, buf_ref_force, buf_out_force):
             w.writerow(row[:6] + tuple(row[6]) + row[7:])
     return path
 
@@ -1189,7 +1231,7 @@ def update_gui():
         ys = [buf[-n:] for _, buf in live_lines]
         latest = [b[-1] if b else NAN for b in
                   (buf_dxl_deg, buf_dxl_tick, buf_dxl_goal_cur, buf_dxl_cur, buf_fz,
-                   buf_tsa_enc, buf_tsa_cur, buf_ref_force, buf_out_force)]
+                   buf_tsa_enc, buf_tsa_cur, buf_tsa_volt, buf_ref_force, buf_out_force)]
 
     if len(t) >= 2:
         for (line, _), y in zip(live_lines, ys):
@@ -1202,7 +1244,7 @@ def update_gui():
             ax.relim()
             ax.autoscale_view(scalex=False, scaley=True)
 
-        dxl_deg, dxl_tick, goal_cur, dxl_cur, fz, enc, cur, ref_f, out_f = latest
+        dxl_deg, dxl_tick, goal_cur, dxl_cur, fz, enc, cur, volt, ref_f, out_f = latest
         live_var.set(
             f"Time        : {t_end:10.3f} s\n\n"
             f"Phase       : {PHASE_NAME[phase]}\n\n"
@@ -1212,7 +1254,8 @@ def update_gui():
             f"DXL Tick    : {fmt(dxl_tick)}\n\n"
             f"FT Fz       : {fmt(fz, 'N')}\n\n"
             f"TSA Encoder : {fmt(enc)}\n"
-            f"TSA Current : {fmt(cur, 'A')}\n\n"
+            f"TSA Current : {fmt(cur, 'A')}\n"
+            f"TSA Voltage : {fmt(volt, 'V')}\n\n"
             f"TSA Ref F   : {fmt(ref_f, 'N')}\n"
             f"TSA Out F   : {fmt(out_f, 'N')}\n\n"
             + connection_text()

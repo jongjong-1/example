@@ -125,7 +125,7 @@ def check_can(iface, bitrate, auto_up, listen_sec):
     if not up:
         if not auto_up:
             print(f"[X] {iface} 가 꺼져 있습니다. 아래 명령 후 다시 실행하세요.")
-            print(f"    sudo ip link set {iface} up type can bitrate {bitrate}")
+            print(f"    sudo ip link set {iface} up type can bitrate {bitrate} restart-ms 100")
             return False
         print(f"[!] {iface} 가 꺼져 있어 켭니다 (bitrate {bitrate})")
         if not can_bring_up(iface, bitrate) or not can_is_up(iface):
