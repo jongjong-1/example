@@ -80,6 +80,11 @@ def can_listen(iface, seconds):
         print(f"    소켓 열기 실패: {e}")
         return
     s.settimeout(0.1)
+    # RFT40 FT 센서는 연속 출력 시작 명령(ID 0x64, 0x0B)을 받아야 데이터(0x01, 0x02)를 보냄
+    try:
+        s.send(struct.pack("=IB3x8s", 0x64, 8, bytes([0x0B, 0, 0, 0, 0, 0, 0, 0])))
+    except OSError as e:
+        print(f"    FT 시작 명령 전송 실패: {e}")
     frames = {}
     end = time.time() + seconds
     while time.time() < end:
@@ -91,8 +96,14 @@ def can_listen(iface, seconds):
         can_id &= socket.CAN_EFF_MASK
         frames.setdefault(can_id, [0, data[8:8 + dlc]])
         frames[can_id][0] += 1
+    try:
+        s.send(struct.pack("=IB3x8s", 0x64, 8, bytes([0x0C, 0, 0, 0, 0, 0, 0, 0])))  # FT 출력 정지
+    except OSError:
+        pass
     s.close()
 
+    if 1 in frames and 2 in frames:
+        print("    [O] FT 센서(RFT40) 응답 확인 (ID 0x001 + 0x002)")
     if not frames:
         print(f"    {seconds:.0f}초 동안 수신된 CAN 프레임 없음")
         print("    (모터가 요청을 받아야만 응답하는 타입이면 정상일 수 있음."

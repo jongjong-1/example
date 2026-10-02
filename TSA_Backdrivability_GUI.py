@@ -10,9 +10,14 @@ TSA 그리퍼 역구동성(Backdrivability) 실험 GUI
   -  DXL Return     : 다이나믹셀을 당기기 전 위치로 복귀 후 토크 OFF
   -  Stop & Save    : 기록 정지 + CSV 저장(backdrive_data 폴더) + 결과 그래프
 
+연결 구조
+  - FT 센서 (Robotous RFT40-SA01) : PCAN-USB (can0)
+  - TSA 모터                       : Arduino Due  ─ USB 시리얼 ─ PC
+  - 다이나믹셀 (MX-64)             : U2D2 (/dev/ttyUSB0)
+
 기록 데이터 (100 Hz)
   - 다이나믹셀 엔코더 (tick, deg), 다이나믹셀 전류 (명령값 / 측정값) [mA]
-  - FT 센서 z축 힘 Fz [N]
+  - FT 센서 6축 (Fx, Fy, Fz [N], Tx, Ty, Tz [Nm])
   - TSA 모터 엔코더, TSA 모터 전류 [A]
   - (참고용) TSA Reference Force / Output Force
 
@@ -21,6 +26,7 @@ TSA 그리퍼 역구동성(Backdrivability) 실험 GUI
 """
 
 import can
+import re
 import struct
 import subprocess
 import time
@@ -40,6 +46,13 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 
 try:
+    import serial
+    from serial.tools import list_ports
+    SERIAL_OK = True
+except ImportError:
+    SERIAL_OK = False
+
+try:
     from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
     DXL_SDK_OK = True
 except ImportError:
@@ -50,15 +63,24 @@ except ImportError:
 #  설정 (CONFIG)  ←  본인 하드웨어에 맞게 여기만 고치면 됩니다
 # =====================================================================
 
-# ---- TSA 그리퍼 (CAN) ----
+# ---- CAN (FT 센서 전용) ----
 CAN_CHANNEL = 'can0'
-CAN_BITRATE = 1000000
+CAN_BITRATE = 1000000      # RFT40-SA01 기본 CAN 속도 1 Mbps
 
-ID_TSA_CMD       = 0x100   # PC -> 그리퍼 : 힘 명령 (float32), b'return'
-ID_TSA_REF_FORCE = 0x201   # 그리퍼 -> PC : Reference Force (float32)
-ID_TSA_OUT_FORCE = 0x202   # 그리퍼 -> PC : Output Force (float32)
-ID_TSA_ENCODER   = 0x203   # 그리퍼 -> PC : TSA 모터 엔코더 (float32)  ★가정: 펌웨어에서 이 ID로 보내야 함
-ID_TSA_CURRENT   = 0x204   # 그리퍼 -> PC : TSA 모터 전류 [A] (float32) ★가정: 펌웨어에서 이 ID로 보내야 함
+# ---- TSA 그리퍼 (Arduino Due, USB 시리얼) ----
+TSA_PORT      = None       # None 이면 Arduino(VID 2341) 포트 자동 검색. 직접 지정 예: '/dev/ttyACM0'
+TSA_BAUD      = 115200     # ★ Due 펌웨어의 Serial.begin(...) 값과 같아야 함
+TSA_BOOT_WAIT = 2.0        # Due Programming Port 는 포트를 열면 보드가 리셋됨 → 부팅 대기 [s]
+ARDUINO_VID   = 0x2341     # Arduino USB VID (다이나믹셀 검색에서는 제외)
+
+# PC -> Due 명령 문자열  ★ Due 펌웨어가 받는 형식에 맞게 고칠 것
+TSA_CMD_FORCE  = "F{:.3f}\n"   # 힘 명령 [N] (0 이면 전류 0)
+TSA_CMD_RETURN = "R\n"         # 원위치
+
+# Due -> PC 한 줄 형식  ★ Due 펌웨어가 보내는 형식에 맞게 고칠 것
+#   "1.2,3.4,1500,0.25" 처럼 숫자만 있으면 → 아래 순서대로 해석 (구분자: , 공백 탭 ;)
+#   "enc:1500 cur:0.25" 처럼 이름이 붙어 있으면 → 이름(ref/out/enc/cur)으로 해석
+TSA_FIELDS = ["ref_force", "out_force", "encoder", "current"]
 
 CLOSE_FORCE_DEFAULT = 5.0    # 그리퍼 오므릴 때 기본 힘 [N]
 CLOSE_FORCE_MAX     = 14.0   # 힘 명령 상한 [N]
@@ -90,11 +112,18 @@ CURRENT_UNIT_MA       = 3.36    # MX-64 : 전류 1단위 = 3.36 mA
 RPM_PER_UNIT          = 0.229   # Profile Velocity 1단위 = 0.229 rpm
 REACH_TOL_TICK        = 10      # 목표 도달 판정 오차 [tick]
 
-# ---- FT 센서 (Robotous RFT 시리즈, CAN 출력 기준) ★가정 ----
-FT_ENABLE        = True
-FT_CMD_ID        = 0x64    # PC -> 센서 명령 ID
-FT_DATA_ID       = 0x01    # 센서 -> PC 데이터 첫 번째 프레임 ID
-FT_FORCE_DIVIDER = 50.0    # raw / 50 = [N]
+# ---- FT 센서: Robotous RFT40-SA01 (CAN) ----
+# 응답 16 byte 가 ID 0x01 (앞 8 byte) + 0x02 (뒤 8 byte) 두 프레임으로 나뉘어 옴
+#   0x01: [cmd, FxH, FxL, FyH, FyL, FzH, FzL, TxH]
+#   0x02: [TxL, TyH, TyL, TzH, TzL, overload, error, -]      (int16 big-endian)
+FT_ENABLE         = True
+FT_CMD_ID         = 0x64     # PC -> 센서 명령 ID
+FT_RESP_ID1       = 0x01     # 센서 -> PC 응답 앞 8 byte
+FT_RESP_ID2       = 0x02     # 센서 -> PC 응답 뒤 8 byte
+FT_CMD_START      = 0x0B     # 연속 출력 시작
+FT_CMD_STOP       = 0x0C     # 연속 출력 정지
+FT_FORCE_DIVIDER  = 50.0     # 힘   = raw / 50   [N]
+FT_TORQUE_DIVIDER = 2000.0   # 토크 = raw / 2000 [Nm]  (RFT40-SA01. ★ 매뉴얼의 DT 값과 다르면 수정)
 FZ_LIMIT_DEFAULT = 20.0    # |Fz| 가 이 값을 넘으면 자동으로 당기기 정지 [N]
 
 # ---- 기록 / 화면 ----
@@ -124,8 +153,9 @@ last_ref_force = NAN
 last_out_force = NAN
 last_tsa_enc   = NAN
 last_tsa_cur   = NAN
-last_fz_raw    = NAN     # 영점 보정 전 Fz
-ft_offset      = 0.0     # FT Zero 버튼으로 잡은 영점
+last_ft_raw    = [NAN] * 6   # 영점 보정 전 [Fx, Fy, Fz, Tx, Ty, Tz]
+ft_offset      = [0.0] * 6   # FT Zero 버튼으로 잡은 영점
+ft_overload    = 0           # RFT 과부하 상태 바이트 (0 이면 정상)
 last_dxl_tick  = NAN     # 다이나믹셀 엔코더 [tick]
 last_dxl_cur   = NAN     # 다이나믹셀 측정 전류 [mA]
 dxl_goal_cur   = 0.0     # 다이나믹셀 명령 전류 [mA]
@@ -153,13 +183,14 @@ buf_t, buf_phase = [], []
 buf_dxl_tick, buf_dxl_deg = [], []
 buf_dxl_goal_cur, buf_dxl_cur = [], []
 buf_fz = []
+buf_ft6 = []                  # (Fx, Fy, Fz, Tx, Ty, Tz) - CSV 저장용
 buf_tsa_enc, buf_tsa_cur = [], []
 buf_ref_force, buf_out_force = [], []
 buf_lock = threading.Lock()   # 기록 스레드와 그래프가 동시에 버퍼를 건드리지 않도록
 
 
 # =====================================================================
-#  CAN (TSA 그리퍼 + FT 센서)
+#  CAN (FT 센서)
 # =====================================================================
 def cmd(command):
     subprocess.run(command, shell=True, check=True)
@@ -192,7 +223,7 @@ def can_setup():
             print(f"[CAN] {CAN_CHANNEL} 켬 ({CAN_BITRATE} bps)")
         except subprocess.CalledProcessError:
             print(f"""
-[CAN] {CAN_CHANNEL} 를 켤 수 없습니다 (sudo 실패). TSA / FT 없이 계속합니다.
+[CAN] {CAN_CHANNEL} 를 켤 수 없습니다 (sudo 실패). FT 센서 없이 계속합니다.
   일반 터미널에서 아래 명령으로 CAN 을 먼저 켠 뒤 다시 실행하세요.
       sudo ip link set {CAN_CHANNEL} up type can bitrate {CAN_BITRATE} restart-ms 100
 """)
@@ -210,8 +241,8 @@ bus = can_setup()
 
 can_rx_counts = {}         # 수신된 CAN ID 별 프레임 수 (연결 진단용)
 can_tx_errors = 0          # 전송 실패 횟수
-last_ft_time  = 0.0        # 마지막 FT 프레임 수신 시각
-last_tsa_time = 0.0        # 마지막 TSA 프레임 수신 시각
+last_ft_time  = 0.0        # 마지막 FT 데이터 수신 시각
+last_tsa_time = 0.0        # 마지막 TSA(Due) 데이터 수신 시각
 can_state_text = "?"       # ip 명령으로 읽은 can state (ERROR-ACTIVE / BUS-OFF ...)
 
 
@@ -231,39 +262,29 @@ def can_send(arb_id, data):
         return False
 
 
-def send_force_value(f):
-    """TSA 그리퍼에 힘 명령 전송 (0 을 보내면 전류 0)"""
-    return can_send(ID_TSA_CMD, struct.pack('<f', f))
+def ft_send_command(command_id, arg=0):
+    """RFT 명령: 8 byte [명령, 인자, 0...] 를 ID 0x64 로 전송"""
+    return can_send(FT_CMD_ID, [command_id, arg, 0, 0, 0, 0, 0, 0])
 
 
-def ft_send_command(command_id):
-    """Robotous RFT 명령 (0x0B: 연속 출력 시작, 0x0C: 정지)"""
-    return can_send(FT_CMD_ID, [command_id, 0, 0, 0, 0, 0, 0, 0])
-
-
-def decode_ft_fz(data):
-    """
-    FT 센서 CAN 프레임에서 Fz [N] 를 꺼내는 함수.
-    ★ FT 센서가 다른 모델이면 이 함수와 위의 FT_* 설정만 바꾸면 됩니다.
-    Robotous RFT: [0x0B, FxH, FxL, FyH, FyL, FzH, FzL, TxH]  (big-endian int16)
-    """
-    if len(data) < 7 or data[0] != 0x0B:
-        return None
-    raw = struct.unpack('>h', bytes(data[5:7]))[0]
-    return raw / FT_FORCE_DIVIDER
+def decode_ft(packet):
+    """RFT 응답 16 byte → ([Fx, Fy, Fz, Tx, Ty, Tz], overload 바이트)"""
+    raw = struct.unpack('>6h', bytes(packet[1:13]))
+    ft = [r / FT_FORCE_DIVIDER for r in raw[:3]] + [r / FT_TORQUE_DIVIDER for r in raw[3:]]
+    return ft, packet[13]
 
 
 def can_rx_thread():
-    global last_ref_force, last_out_force, last_tsa_enc, last_tsa_cur, last_fz_raw
-    global last_ft_time, last_tsa_time
+    global last_ft_raw, last_ft_time, ft_overload
 
+    ft_first = None          # 0x01 로 받은 앞 8 byte (0x02 를 기다리는 중)
     next_ft_retry = time.time() + 1.0
     while running:
         # FT 데이터가 1초 넘게 안 오면 연속 출력 시작 명령을 다시 보냄
         # (센서 전원을 프로그램보다 늦게 켠 경우 등)
         now = time.time()
         if FT_ENABLE and now - last_ft_time > 1.0 and now > next_ft_retry:
-            ft_send_command(0x0B)
+            ft_send_command(FT_CMD_START)
             next_ft_retry = now + 1.0
 
         try:
@@ -278,31 +299,21 @@ def can_rx_thread():
 
         aid = rx.arbitration_id
         can_rx_counts[aid] = can_rx_counts.get(aid, 0) + 1
-
-        # ---- FT 센서 ----
-        if FT_ENABLE and aid == FT_DATA_ID:
-            fz = decode_ft_fz(rx.data)
-            if fz is not None:
-                last_fz_raw = fz
-                last_ft_time = time.time()
+        if not FT_ENABLE:
             continue
 
-        # ---- TSA 그리퍼 (모두 float32) ----
-        if len(rx.data) < 4:
-            continue
-        value = struct.unpack('<f', bytes(rx.data[:4]))[0]
-
-        if aid == ID_TSA_REF_FORCE:
-            last_ref_force = value
-        elif aid == ID_TSA_OUT_FORCE:
-            last_out_force = value
-        elif aid == ID_TSA_ENCODER:
-            last_tsa_enc = value
-        elif aid == ID_TSA_CURRENT:
-            last_tsa_cur = value
-        else:
-            continue
-        last_tsa_time = time.time()
+        # ---- FT 센서: 0x01 + 0x02 두 프레임을 합쳐서 16 byte 로 해석 ----
+        if aid == FT_RESP_ID1 and len(rx.data) == 8:
+            # 연속 출력(0x0B) 또는 1회 읽기(0x0A) 응답만 사용
+            ft_first = bytes(rx.data) if rx.data[0] in (0x0A, 0x0B) else None
+        elif aid == FT_RESP_ID2 and len(rx.data) == 8 and ft_first is not None:
+            ft, overload = decode_ft(ft_first + bytes(rx.data))
+            ft_first = None
+            last_ft_raw = ft
+            last_ft_time = time.time()
+            if overload and not ft_overload:
+                print(f"[FT] 과부하 경고 (overload byte 0x{overload:02X})")
+            ft_overload = overload
 
 
 def can_state_thread():
@@ -325,6 +336,117 @@ def can_state_thread():
         except Exception:
             pass
         time.sleep(1.0)
+
+
+# =====================================================================
+#  TSA 그리퍼 (Arduino Due, USB 시리얼)
+# =====================================================================
+tsa_ser = None
+tsa_lock = threading.Lock()
+tsa_last_line = ""         # Due 가 마지막으로 보낸 한 줄 (화면에 그대로 표시 → 형식 확인용)
+tsa_line_count = 0
+
+# "enc:123" / "cur=0.5" 처럼 이름이 붙은 값
+_TSA_PAIR = re.compile(r'([A-Za-z_]+)\s*[:=]\s*(-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)')
+_TSA_NUM = re.compile(r'-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?')
+_TSA_KEYS = [("ref", "ref_force"), ("out", "out_force"), ("enc", "encoder"),
+             ("pos", "encoder"), ("cur", "current"), ("amp", "current")]
+
+
+def find_tsa_port():
+    """Arduino(VID 2341) 포트 검색. Native Port(003e) 를 Programming Port(003d) 보다 우선"""
+    if TSA_PORT:
+        return TSA_PORT
+    if not SERIAL_OK:
+        return None
+    ports = [p for p in list_ports.comports() if p.vid == ARDUINO_VID]
+    ports.sort(key=lambda p: p.pid != 0x003e)
+    return ports[0].device if ports else None
+
+
+def tsa_init():
+    global tsa_ser
+    if not SERIAL_OK:
+        print("[TSA] pyserial 이 없습니다:  pip install pyserial")
+        return
+    port = find_tsa_port()
+    if port is None:
+        print("[TSA] Arduino Due 포트를 찾지 못했습니다. USB 연결 확인")
+        return
+    try:
+        tsa_ser = serial.Serial(port, TSA_BAUD, timeout=0.1, write_timeout=0.1)
+    except Exception as e:
+        print(f"[TSA] {port} 열기 실패: {e}")
+        print("      Arduino IDE 시리얼 모니터 등 다른 프로그램이 포트를 쓰고 있지 않은지 확인")
+        tsa_ser = None
+        return
+    print(f"[TSA] {port} 열림 ({TSA_BAUD} bps). Due 부팅 대기 {TSA_BOOT_WAIT:.0f} s ...")
+    time.sleep(TSA_BOOT_WAIT)
+    tsa_ser.reset_input_buffer()
+
+
+def tsa_write(text):
+    """Due 로 명령 전송. 실패해도 예외로 죽지 않음"""
+    if tsa_ser is None:
+        return False
+    try:
+        with tsa_lock:
+            tsa_ser.write(text.encode())
+        return True
+    except Exception as e:
+        print(f"[TSA] 전송 실패: {e}")
+        return False
+
+
+def send_force_value(f):
+    """TSA 그리퍼에 힘 명령 전송 (0 을 보내면 전류 0)"""
+    return tsa_write(TSA_CMD_FORCE.format(f))
+
+
+def parse_tsa_line(line):
+    """Due 가 보낸 한 줄 → {필드이름: 값}. 형식은 위 TSA_FIELDS 설명 참고"""
+    pairs = _TSA_PAIR.findall(line)
+    if pairs:
+        out = {}
+        for key, val in pairs:
+            key = key.lower()
+            for prefix, field in _TSA_KEYS:
+                if key.startswith(prefix) and field not in out:
+                    out[field] = float(val)
+                    break
+        return out
+    nums = _TSA_NUM.findall(line)
+    return {field: float(v) for field, v in zip(TSA_FIELDS, nums)}
+
+
+def tsa_rx_thread():
+    global last_ref_force, last_out_force, last_tsa_enc, last_tsa_cur
+    global last_tsa_time, tsa_last_line, tsa_line_count
+
+    while running:
+        try:
+            raw = tsa_ser.readline()
+        except Exception as e:
+            print(f"[TSA] 수신 오류 (USB 가 빠졌는지 확인): {e}")
+            time.sleep(1.0)
+            continue
+        line = raw.decode(errors="replace").strip()
+        if not line:
+            continue
+
+        tsa_last_line = line
+        tsa_line_count += 1
+        if tsa_line_count <= 5:
+            print(f"[TSA] 수신 예시: {line!r}")   # 처음 몇 줄은 터미널에 출력 (형식 확인용)
+
+        values = parse_tsa_line(line)
+        if not values:
+            continue
+        last_ref_force = values.get("ref_force", last_ref_force)
+        last_out_force = values.get("out_force", last_out_force)
+        last_tsa_enc = values.get("encoder", last_tsa_enc)
+        last_tsa_cur = values.get("current", last_tsa_cur)
+        last_tsa_time = time.time()
 
 
 # =====================================================================
@@ -423,7 +545,6 @@ def set_usb_low_latency():
 
 
 DXL_SCAN_BAUDS = [3000000, 57600, 1000000, 2000000, 4000000, 115200, 4500000]
-ARDUINO_VID    = 0x2341     # Arduino 포트는 다이나믹셀 검색에서 제외 (열면 보드가 리셋될 수 있음)
 
 
 def dxl_candidate_ports():
@@ -544,7 +665,7 @@ def dxl_thread():
 
             # ---- 당기는 중 ----
             if phase == PHASE_PULL:
-                fz = last_fz_raw - ft_offset
+                fz = last_ft_raw[2] - ft_offset[2]
                 moved = abs(tick_to_deg(last_dxl_tick - pull_start_tick))
                 if moved > pull_angle_max:
                     stop_pull(f"Max Angle ({pull_angle_max:.0f} deg) 도달로 자동 정지")
@@ -599,7 +720,7 @@ def close_gripper():
     f = min(max(f, 0.0), CLOSE_FORCE_MAX)
 
     if not send_force_value(f):
-        set_status("CAN 전송 실패 - TSA 에 명령이 안 감 (CAN 상태 확인)", "red")
+        set_status("TSA(Due) 전송 실패 - 명령이 안 감 (터미널 메시지 확인)", "red")
         return
     phase = PHASE_CLOSE
     zero_ready = False
@@ -611,7 +732,7 @@ def zero_current():
     """2단계: TSA 전류 0"""
     global phase, zero_ready
     if not send_force_value(0.0):
-        set_status("CAN 전송 실패 - TSA 전류 0 명령이 안 감 (CAN 상태 확인)", "red")
+        set_status("TSA(Due) 전송 실패 - 전류 0 명령이 안 감 (터미널 메시지 확인)", "red")
         return
 
     if phase in (PHASE_PULL, PHASE_HOLD, PHASE_RETURN):
@@ -728,8 +849,8 @@ def dxl_return():
 def tsa_return():
     """그리퍼 원위치 (기존 코드의 Return 과 동일한 CAN 메시지)"""
     global phase, zero_ready
-    if not can_send(ID_TSA_CMD, b'return'):
-        set_status("CAN 전송 실패 - TSA Return 명령이 안 감 (CAN 상태 확인)", "red")
+    if not tsa_write(TSA_CMD_RETURN):
+        set_status("TSA(Due) 전송 실패 - Return 명령이 안 감 (터미널 메시지 확인)", "red")
         return
     phase = PHASE_IDLE
     zero_ready = False
@@ -740,10 +861,10 @@ def tsa_return():
 def ft_zero():
     """현재 Fz 를 0 으로 잡음 (소프트웨어 영점)"""
     global ft_offset
-    if math.isnan(last_fz_raw):
+    if math.isnan(last_ft_raw[2]):
         set_status("FT 센서 데이터 수신 없음", "red")
         return
-    ft_offset = last_fz_raw
+    ft_offset = list(last_ft_raw)    # 6축 모두 현재 값을 영점으로
     set_status("FT Fz 영점 설정 완료")
 
 
@@ -774,7 +895,9 @@ def logger_thread():
                 buf_dxl_deg.append(tick_to_deg(last_dxl_tick))
                 buf_dxl_goal_cur.append(dxl_goal_cur if phase == PHASE_PULL else 0.0)
                 buf_dxl_cur.append(last_dxl_cur)
-                buf_fz.append(last_fz_raw - ft_offset)
+                ft = [v - o for v, o in zip(last_ft_raw, ft_offset)]
+                buf_fz.append(ft[2])
+                buf_ft6.append(ft)
                 buf_tsa_enc.append(last_tsa_enc)
                 buf_tsa_cur.append(last_tsa_cur)
                 buf_ref_force.append(last_ref_force)
@@ -797,12 +920,13 @@ def save_csv():
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["time_s", "phase", "dxl_tick", "dxl_deg",
-                    "dxl_goal_current_mA", "dxl_current_mA", "ft_fz_N",
+                    "dxl_goal_current_mA", "dxl_current_mA",
+                    "ft_fx_N", "ft_fy_N", "ft_fz_N", "ft_tx_Nm", "ft_ty_Nm", "ft_tz_Nm",
                     "tsa_encoder", "tsa_current_A", "tsa_ref_force_N", "tsa_out_force_N"])
         for row in zip(buf_t, buf_phase, buf_dxl_tick, buf_dxl_deg,
-                       buf_dxl_goal_cur, buf_dxl_cur, buf_fz,
+                       buf_dxl_goal_cur, buf_dxl_cur, buf_ft6,
                        buf_tsa_enc, buf_tsa_cur, buf_ref_force, buf_out_force):
-            w.writerow(row)
+            w.writerow(row[:6] + tuple(row[6]) + row[7:])
     return path
 
 
@@ -1025,12 +1149,22 @@ def connection_text():
             can_line += f"CAN TX 실패 : {can_tx_errors} 회\n"
     ids = sorted(can_rx_counts.items(), key=lambda kv: -kv[1])[:6]
     id_text = ", ".join(f"0x{i:03X}" for i, _ in ids) if ids else "없음"
+    ft_text = alive(last_ft_time) if bus else "-"
+    if ft_overload:
+        ft_text += " (과부하!)"
+    if tsa_ser is None:
+        tsa_text = "연결 안 됨 (터미널 확인)"
+    elif tsa_line_count == 0:
+        tsa_text = f"{tsa_ser.port} 열림, 수신 없음"
+    else:
+        tsa_text = alive(last_tsa_time) if last_tsa_time else "수신 중, 해석 안 됨"
     return (
         "---- 연결 상태 ----\n"
         + can_line
         + f"CAN 수신 ID : {id_text}\n"
-        + f"FT 센서     : {alive(last_ft_time) if bus else '-'}\n"
-        + f"TSA 피드백  : {alive(last_tsa_time) if bus else '-'}\n"
+        + f"FT 센서     : {ft_text}\n"
+        + f"TSA (Due)   : {tsa_text}\n"
+        + f"Due 마지막줄: {tsa_last_line[:22]}\n"
         + f"DXL         : {f'OK (ID {DXL_ID}, {DXL_PORT})' if dxl_ok else '연결 안 됨'}"
     )
 
@@ -1100,9 +1234,15 @@ def on_close():
     try:
         send_force_value(0.0)
         if FT_ENABLE:
-            ft_send_command(0x0C)      # FT 연속 출력 정지
+            ft_send_command(FT_CMD_STOP)   # FT 연속 출력 정지
     except Exception:
         pass
+    if tsa_ser is not None:
+        try:
+            tsa_ser.flush()
+            tsa_ser.close()
+        except Exception:
+            pass
     if dxl_ok:
         with dxl_lock:
             dxl_torque(False)
@@ -1117,22 +1257,25 @@ def on_close():
     sys.exit(0)
 
 
+tsa_init()                             # Due USB 시리얼 연결 (열면 Due 가 리셋되므로 부팅 대기)
 dxl_init()                             # 토크 OFF 상태로 연결만 함 (움직이지 않음)
 if FT_ENABLE:
-    ft_send_command(0x0B)              # FT 연속 출력 시작
+    ft_send_command(FT_CMD_START)      # FT 연속 출력 시작
 
 if bus is not None:
     threading.Thread(target=can_rx_thread, daemon=True).start()
     threading.Thread(target=can_state_thread, daemon=True).start()
+if tsa_ser is not None:
+    threading.Thread(target=tsa_rx_thread, daemon=True).start()
 if dxl_ok:
     threading.Thread(target=dxl_thread, daemon=True).start()
 
-if bus is None and not dxl_ok:
-    set_status("CAN, 다이나믹셀 모두 연결 안 됨 (터미널 메시지 확인)", "red")
-elif bus is None:
-    set_status("CAN 연결 안 됨 - TSA/FT 없이 다이나믹셀만 동작 (터미널 메시지 확인)", "orange")
-elif not dxl_ok:
-    set_status("다이나믹셀 연결 안 됨 (터미널 메시지 확인) - TSA/FT 만 동작", "orange")
+missing = [name for name, ok in (("TSA(Due)", tsa_ser is not None),
+                                 ("FT(CAN)", bus is not None),
+                                 ("다이나믹셀", dxl_ok)) if not ok]
+if missing:
+    set_status(f"연결 안 됨: {', '.join(missing)}  (터미널 메시지 확인)",
+               "red" if len(missing) == 3 else "orange")
 
 threading.Thread(target=logger_thread, daemon=True).start()
 update_gui()
