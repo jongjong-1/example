@@ -3,6 +3,7 @@
 
     python3 ft_test.py           # 1 Mbps 로 점검
     python3 ft_test.py --scan    # 여러 bitrate 로 시도 (센서 bitrate 를 모를 때)
+    python3 ft_test.py --id-scan # 센서 명령 ID 를 모를 때 0x000~0x7FF 전부 시도
 
 순서: can0 설정 확인/수정 → 모델명 읽기(0x01) → 연속 출력(0x0B) 2초 수신 → 원인 진단
 """
@@ -172,12 +173,64 @@ def diagnose(data_pk, frames, info, tx_ok):
         print("    python3 ft_test.py --scan 으로 bitrate 를 찾아보세요.")
     else:
         print("[!] 명령은 전달(ACK)됐는데 FT 센서가 응답하지 않습니다.")
-        print("    → 센서의 명령 ID 가 0x64 가 아니거나, 다른 장치만 ACK 하는 중일 수 있습니다.")
+        print("    ACK 는 버스에 있는 '아무' 장치나 해 줍니다. 누가 ACK 하는지부터 확인하세요:")
+        print("    1) FT 센서 CAN 선(또는 전원)을 빼고 python3 ft_test.py 다시 실행")
+        print("       - 여전히 '명령은 전달(ACK)됐는데...' → ACK 는 다른 장치(예: Due 의 CAN 쉴드)가 함")
+        print("         = FT 센서는 버스에 안 붙어 있음 → 센서 전원 / CAN_H·CAN_L 배선 확인")
+        print("       - 'ACK 받지 않았습니다' 로 바뀜 → FT 센서는 버스에 있고 ACK 도 함")
+        print("         = 센서 명령 ID 가 0x64 가 아님 → python3 ft_test.py --id-scan")
+        print("    2) 버스에 PCAN 과 FT 센서 말고 다른 장치(Due CAN 등)가 연결돼 있는지 확인")
+
+
+def id_scan():
+    """모든 표준 ID(0x000~0x7FF)로 '모델명 읽기(0x01)' 를 보내서 응답하는 ID 찾기"""
+    print("[!] 모든 CAN ID 로 명령을 보냅니다. TSA(Due) 등 다른 장치가 CAN 에 연결돼 있으면")
+    print("    엉뚱한 명령으로 받아들여 움직일 수 있으니, FT 센서만 연결된 상태에서 하세요.")
+    if input("    FT 센서만 연결돼 있습니까? (y/N) ").strip().lower() != "y":
+        return
+    info = can_info()
+    if not info["up"] or info["bitrate"] != 1000000 or not info["restart_ms"]:
+        configure(1000000)
+    s = open_socket()
+    listen(s, 0.1)
+
+    def probe(cid, wait):
+        frame = struct.pack("=IB3x8s", cid, 8, bytes([0x01, 0, 0, 0, 0, 0, 0, 0]))
+        for _ in range(50):
+            try:
+                s.send(frame)
+                break
+            except OSError:          # 송신 버퍼가 가득 차면 잠깐 대기
+                time.sleep(0.01)
+        return listen(s, wait)
+
+    candidates = set()
+    for cid in range(0x800):
+        if cid % 0x100 == 0:
+            print(f"  0x{cid:03X} ~ 0x{cid + 0xFF:03X} 시도 중...")
+        if probe(cid, 0.004):
+            candidates.update({cid, max(0, cid - 1), max(0, cid - 2)})
+
+    found = False
+    for cid in sorted(candidates):           # 응답이 늦게 와서 다음 ID 에 잡혔을 수 있으므로 재확인
+        frames = probe(cid, 0.1)
+        if frames:
+            found = True
+            ids = ", ".join(sorted({f"0x{f[0]:03X}" for f in frames}))
+            print(f"  [O] 명령 ID 0x{cid:03X} 에 응답 → 응답 ID {ids}")
+            for fid, d in frames[:2]:
+                print(f"      0x{fid:03X}: {d.hex(' ')}  {d[1:].decode(errors='replace')!r}")
+    s.close()
+    if not found:
+        print("  [X] 어떤 ID 에도 응답 없음 → 센서가 CAN 모드가 아니거나(UART), 전원/배선 문제")
+    else:
+        print("  → 찾은 ID 를 GUI 의 FT_CMD_ID / FT_RESP_ID1 / FT_RESP_ID2 에 넣으세요.")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scan", action="store_true", help="여러 bitrate 로 시도")
+    ap.add_argument("--id-scan", action="store_true", help="센서 명령 ID 찾기")
     args = ap.parse_args()
 
     if not os.path.exists(f"/sys/class/net/{IFACE}"):
@@ -188,6 +241,11 @@ def main():
           f"restart-ms {info['restart_ms']}, state {info['state']}")
     if info["restart_ms"] == 0:
         print("  [!] restart-ms 0 → 한 번 BUS-OFF 되면 다시 켤 때까지 통신이 영원히 멈춤 (수정함)")
+
+    if args.id_scan:
+        print()
+        id_scan()
+        return
 
     if not args.scan:
         print("\n[1 Mbps 로 FT 센서 점검]")

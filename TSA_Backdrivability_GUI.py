@@ -79,10 +79,8 @@ TSA_CMD_RETURN = "R\n"         # 원위치
 
 # Due -> PC 한 줄 형식  ★ Due 펌웨어가 보내는 형식에 맞게 고칠 것
 #   "1.2,3.4,1500,0.25" 처럼 숫자만 있으면 → 아래 순서대로 해석 (구분자: , 공백 탭 ;)
-#   "enc:1500 cur:0.25 volt:11.8" 처럼 이름이 붙어 있으면 → 이름(ref/out/enc/cur/volt)으로 해석
-#   사용 가능한 필드: ref_force, out_force, encoder, current, voltage
-#   (펌웨어가 전압을 5번째 값으로 보내면 "voltage" 를 추가: [..., "current", "voltage"])
-TSA_FIELDS = ["ref_force", "out_force", "encoder", "current", "voltage"]
+#   "enc:1500 cur:0.25" 처럼 이름이 붙어 있으면 → 이름(ref/out/enc/cur)으로 해석
+TSA_FIELDS = ["ref_force", "out_force", "encoder", "current"]
 
 CLOSE_FORCE_DEFAULT = 5.0    # 그리퍼 오므릴 때 기본 힘 [N]
 CLOSE_FORCE_MAX     = 14.0   # 힘 명령 상한 [N]
@@ -155,7 +153,6 @@ last_ref_force = NAN
 last_out_force = NAN
 last_tsa_enc   = NAN
 last_tsa_cur   = NAN
-last_tsa_volt  = NAN
 last_ft_raw    = [NAN] * 6   # 영점 보정 전 [Fx, Fy, Fz, Tx, Ty, Tz]
 ft_offset      = [0.0] * 6   # FT Zero 버튼으로 잡은 영점
 ft_overload    = 0           # RFT 과부하 상태 바이트 (0 이면 정상)
@@ -187,7 +184,7 @@ buf_dxl_tick, buf_dxl_deg = [], []
 buf_dxl_goal_cur, buf_dxl_cur = [], []
 buf_fz = []
 buf_ft6 = []                  # (Fx, Fy, Fz, Tx, Ty, Tz) - CSV 저장용
-buf_tsa_enc, buf_tsa_cur, buf_tsa_volt = [], [], []
+buf_tsa_enc, buf_tsa_cur = [], []
 buf_ref_force, buf_out_force = [], []
 buf_lock = threading.Lock()   # 기록 스레드와 그래프가 동시에 버퍼를 건드리지 않도록
 
@@ -385,8 +382,7 @@ tsa_line_count = 0
 _TSA_PAIR = re.compile(r'([A-Za-z_]+)\s*[:=]\s*(-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)')
 _TSA_NUM = re.compile(r'-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?')
 _TSA_KEYS = [("ref", "ref_force"), ("out", "out_force"), ("enc", "encoder"),
-             ("pos", "encoder"), ("cur", "current"), ("amp", "current"),
-             ("vol", "voltage")]
+             ("pos", "encoder"), ("cur", "current"), ("amp", "current")]
 
 
 def find_tsa_port():
@@ -446,9 +442,6 @@ def parse_tsa_line(line):
         out = {}
         for key, val in pairs:
             key = key.lower()
-            if key == "v" and "voltage" not in out:      # "V:11.8"
-                out["voltage"] = float(val)
-                continue
             for prefix, field in _TSA_KEYS:
                 if key.startswith(prefix) and field not in out:
                     out[field] = float(val)
@@ -459,7 +452,7 @@ def parse_tsa_line(line):
 
 
 def tsa_rx_thread():
-    global last_ref_force, last_out_force, last_tsa_enc, last_tsa_cur, last_tsa_volt
+    global last_ref_force, last_out_force, last_tsa_enc, last_tsa_cur
     global last_tsa_time, tsa_last_line, tsa_line_count
 
     while running:
@@ -485,7 +478,6 @@ def tsa_rx_thread():
         last_out_force = values.get("out_force", last_out_force)
         last_tsa_enc = values.get("encoder", last_tsa_enc)
         last_tsa_cur = values.get("current", last_tsa_cur)
-        last_tsa_volt = values.get("voltage", last_tsa_volt)
         last_tsa_time = time.time()
 
 
@@ -940,7 +932,6 @@ def logger_thread():
                 buf_ft6.append(ft)
                 buf_tsa_enc.append(last_tsa_enc)
                 buf_tsa_cur.append(last_tsa_cur)
-                buf_tsa_volt.append(last_tsa_volt)
                 buf_ref_force.append(last_ref_force)
                 buf_out_force.append(last_out_force)
 
@@ -963,11 +954,10 @@ def save_csv():
         w.writerow(["time_s", "phase", "dxl_tick", "dxl_deg",
                     "dxl_goal_current_mA", "dxl_current_mA",
                     "ft_fx_N", "ft_fy_N", "ft_fz_N", "ft_tx_Nm", "ft_ty_Nm", "ft_tz_Nm",
-                    "tsa_encoder", "tsa_current_A", "tsa_voltage_V",
-                    "tsa_ref_force_N", "tsa_out_force_N"])
+                    "tsa_encoder", "tsa_current_A", "tsa_ref_force_N", "tsa_out_force_N"])
         for row in zip(buf_t, buf_phase, buf_dxl_tick, buf_dxl_deg,
                        buf_dxl_goal_cur, buf_dxl_cur, buf_ft6,
-                       buf_tsa_enc, buf_tsa_cur, buf_tsa_volt, buf_ref_force, buf_out_force):
+                       buf_tsa_enc, buf_tsa_cur, buf_ref_force, buf_out_force):
             w.writerow(row[:6] + tuple(row[6]) + row[7:])
     return path
 
@@ -1231,7 +1221,7 @@ def update_gui():
         ys = [buf[-n:] for _, buf in live_lines]
         latest = [b[-1] if b else NAN for b in
                   (buf_dxl_deg, buf_dxl_tick, buf_dxl_goal_cur, buf_dxl_cur, buf_fz,
-                   buf_tsa_enc, buf_tsa_cur, buf_tsa_volt, buf_ref_force, buf_out_force)]
+                   buf_tsa_enc, buf_tsa_cur, buf_ref_force, buf_out_force)]
 
     if len(t) >= 2:
         for (line, _), y in zip(live_lines, ys):
@@ -1244,7 +1234,7 @@ def update_gui():
             ax.relim()
             ax.autoscale_view(scalex=False, scaley=True)
 
-        dxl_deg, dxl_tick, goal_cur, dxl_cur, fz, enc, cur, volt, ref_f, out_f = latest
+        dxl_deg, dxl_tick, goal_cur, dxl_cur, fz, enc, cur, ref_f, out_f = latest
         live_var.set(
             f"Time        : {t_end:10.3f} s\n\n"
             f"Phase       : {PHASE_NAME[phase]}\n\n"
@@ -1254,8 +1244,7 @@ def update_gui():
             f"DXL Tick    : {fmt(dxl_tick)}\n\n"
             f"FT Fz       : {fmt(fz, 'N')}\n\n"
             f"TSA Encoder : {fmt(enc)}\n"
-            f"TSA Current : {fmt(cur, 'A')}\n"
-            f"TSA Voltage : {fmt(volt, 'V')}\n\n"
+            f"TSA Current : {fmt(cur, 'A')}\n\n"
             f"TSA Ref F   : {fmt(ref_f, 'N')}\n"
             f"TSA Out F   : {fmt(out_f, 'N')}\n\n"
             + connection_text()
