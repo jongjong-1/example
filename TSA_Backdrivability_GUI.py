@@ -174,42 +174,71 @@ def can_is_up():
         return False
 
 
-can_started_here = False   # 이 프로그램이 can0 를 켰으면 종료할 때 끔
-try:
-    cmd(f"sudo ip link set {CAN_CHANNEL} down")
-    cmd(f"sudo ip link set {CAN_CHANNEL} up type can bitrate {CAN_BITRATE}")
-    can_started_here = True
-except subprocess.CalledProcessError:
-    # sudo 를 쓸 수 없는 터미널(VS Code 통합 터미널 등)에서 실행한 경우
-    if can_is_up():
-        print(f"[CAN] sudo 를 쓸 수 없어서, 이미 켜져 있는 {CAN_CHANNEL} 를 그대로 사용합니다.")
-    else:
-        print(f"""
-[CAN] {CAN_CHANNEL} 를 켤 수 없습니다 (이 터미널에서는 sudo 가 막혀 있음).
-  방법 1) 일반 터미널(Ctrl+Alt+T)에서 이 프로그램을 실행
-  방법 2) 일반 터미널에서 아래 명령으로 CAN 만 먼저 켠 뒤, 여기서 다시 실행
-          sudo ip link set {CAN_CHANNEL} up type can bitrate {CAN_BITRATE}
-""")
-        sys.exit(1)
-time.sleep(0.1)
+def can_setup():
+    """can0 를 켜고 Bus 를 연다. 실패해도 프로그램은 계속 (다이나믹셀만이라도 쓰도록)"""
+    if not os.path.exists(f"/sys/class/net/{CAN_CHANNEL}"):
+        print(f"[CAN] {CAN_CHANNEL} 가 없습니다. PCAN-USB 연결 / 드라이버(peak_usb) 확인")
+        return None
 
-bus = can.interface.Bus(channel=CAN_CHANNEL, bustype='socketcan')
+    if can_is_up():
+        # 이미 켜져 있으면 sudo 없이 그대로 사용
+        print(f"[CAN] 이미 켜져 있는 {CAN_CHANNEL} 를 사용합니다.")
+    else:
+        try:
+            cmd(f"sudo ip link set {CAN_CHANNEL} down")
+            # restart-ms 100 : BUS-OFF 가 되어도 0.1 s 뒤 자동 복구 (없으면 영원히 멈춤)
+            cmd(f"sudo ip link set {CAN_CHANNEL} type can bitrate {CAN_BITRATE} restart-ms 100")
+            cmd(f"sudo ip link set {CAN_CHANNEL} up")
+            print(f"[CAN] {CAN_CHANNEL} 켬 ({CAN_BITRATE} bps)")
+        except subprocess.CalledProcessError:
+            print(f"""
+[CAN] {CAN_CHANNEL} 를 켤 수 없습니다 (sudo 실패). TSA / FT 없이 계속합니다.
+  일반 터미널에서 아래 명령으로 CAN 을 먼저 켠 뒤 다시 실행하세요.
+      sudo ip link set {CAN_CHANNEL} up type can bitrate {CAN_BITRATE} restart-ms 100
+""")
+            return None
+        time.sleep(0.1)
+
+    try:
+        return can.interface.Bus(channel=CAN_CHANNEL, interface='socketcan')
+    except Exception as e:
+        print(f"[CAN] Bus 열기 실패: {e}")
+        return None
+
+
+bus = can_setup()
+
+can_rx_counts = {}         # 수신된 CAN ID 별 프레임 수 (연결 진단용)
+can_tx_errors = 0          # 전송 실패 횟수
+last_ft_time  = 0.0        # 마지막 FT 프레임 수신 시각
+last_tsa_time = 0.0        # 마지막 TSA 프레임 수신 시각
+can_state_text = "?"       # ip 명령으로 읽은 can state (ERROR-ACTIVE / BUS-OFF ...)
+
+
+def can_send(arb_id, data):
+    """CAN 전송. 버스가 없거나 전송 실패(ACK 없음, 버퍼 가득 등)해도 예외로 죽지 않음"""
+    global can_tx_errors
+    if bus is None:
+        return False
+    try:
+        bus.send(can.Message(arbitration_id=arb_id, data=data, is_extended_id=False),
+                 timeout=0.05)
+        return True
+    except Exception as e:
+        can_tx_errors += 1
+        if can_tx_errors <= 5 or can_tx_errors % 100 == 0:
+            print(f"[CAN] 전송 실패 (ID 0x{arb_id:03X}, 누적 {can_tx_errors}회): {e}")
+        return False
 
 
 def send_force_value(f):
     """TSA 그리퍼에 힘 명령 전송 (0 을 보내면 전류 0)"""
-    msg = can.Message(arbitration_id=ID_TSA_CMD,
-                      data=struct.pack('<f', f),
-                      is_extended_id=False)
-    bus.send(msg)
+    return can_send(ID_TSA_CMD, struct.pack('<f', f))
 
 
 def ft_send_command(command_id):
     """Robotous RFT 명령 (0x0B: 연속 출력 시작, 0x0C: 정지)"""
-    msg = can.Message(arbitration_id=FT_CMD_ID,
-                      data=[command_id, 0, 0, 0, 0, 0, 0, 0],
-                      is_extended_id=False)
-    bus.send(msg)
+    return can_send(FT_CMD_ID, [command_id, 0, 0, 0, 0, 0, 0, 0])
 
 
 def decode_ft_fz(data):
@@ -226,28 +255,42 @@ def decode_ft_fz(data):
 
 def can_rx_thread():
     global last_ref_force, last_out_force, last_tsa_enc, last_tsa_cur, last_fz_raw
+    global last_ft_time, last_tsa_time
 
+    next_ft_retry = time.time() + 1.0
     while running:
+        # FT 데이터가 1초 넘게 안 오면 연속 출력 시작 명령을 다시 보냄
+        # (센서 전원을 프로그램보다 늦게 켠 경우 등)
+        now = time.time()
+        if FT_ENABLE and now - last_ft_time > 1.0 and now > next_ft_retry:
+            ft_send_command(0x0B)
+            next_ft_retry = now + 1.0
+
         try:
             rx = bus.recv(timeout=0.1)
-        except Exception:
-            break
-        if rx is None:
+        except Exception as e:
+            # 예전 코드는 여기서 break 해서 수신 스레드가 조용히 죽었음
+            print(f"[CAN] 수신 오류: {e}")
+            time.sleep(0.5)
+            continue
+        if rx is None or rx.is_error_frame or rx.is_remote_frame:
             continue
 
         aid = rx.arbitration_id
+        can_rx_counts[aid] = can_rx_counts.get(aid, 0) + 1
 
         # ---- FT 센서 ----
         if FT_ENABLE and aid == FT_DATA_ID:
             fz = decode_ft_fz(rx.data)
             if fz is not None:
                 last_fz_raw = fz
+                last_ft_time = time.time()
             continue
 
         # ---- TSA 그리퍼 (모두 float32) ----
         if len(rx.data) < 4:
             continue
-        value = struct.unpack('<f', rx.data[:4])[0]
+        value = struct.unpack('<f', bytes(rx.data[:4]))[0]
 
         if aid == ID_TSA_REF_FORCE:
             last_ref_force = value
@@ -257,6 +300,31 @@ def can_rx_thread():
             last_tsa_enc = value
         elif aid == ID_TSA_CURRENT:
             last_tsa_cur = value
+        else:
+            continue
+        last_tsa_time = time.time()
+
+
+def can_state_thread():
+    """1초마다 can0 상태(ERROR-ACTIVE / ERROR-PASSIVE / BUS-OFF)를 읽어 화면에 표시"""
+    global can_state_text
+    while running:
+        try:
+            out = subprocess.run(["ip", "-details", "link", "show", CAN_CHANNEL],
+                                 capture_output=True, text=True, timeout=1).stdout
+            state = "DOWN" if "state DOWN" in out else "?"
+            for line in out.splitlines():
+                words = line.split()
+                if words[:2] == ["can", "state"] and len(words) > 2:
+                    state = words[2]
+                    # 예: "can state ERROR-ACTIVE (berr-counter tx 0 rx 0) restart-ms 100"
+                    for i, w in enumerate(words):
+                        if w.endswith("berr-counter") and len(words) > i + 4:
+                            state += f" (tx err {words[i + 2]}, rx err {words[i + 4].rstrip(')')})"
+            can_state_text = state
+        except Exception:
+            pass
+        time.sleep(1.0)
 
 
 # =====================================================================
@@ -354,28 +422,114 @@ def set_usb_low_latency():
         print("[DXL] latency_timer 를 1 ms 로 못 바꿈 → 다이나믹셀 값이 약 30~60 Hz 로만 갱신됩니다.")
 
 
+DXL_SCAN_BAUDS = [3000000, 57600, 1000000, 2000000, 4000000, 115200, 4500000]
+ARDUINO_VID    = 0x2341     # Arduino 포트는 다이나믹셀 검색에서 제외 (열면 보드가 리셋될 수 있음)
+
+
+def dxl_candidate_ports():
+    """설정된 DXL_PORT 를 먼저, 그 다음 다른 USB 시리얼 포트 (Arduino 제외)"""
+    ports = [DXL_PORT]
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            if p.vid == ARDUINO_VID or "arduino" in f"{p.description} {p.manufacturer}".lower():
+                continue
+            if ("ttyUSB" in p.device or "ttyACM" in p.device) and p.device not in ports:
+                ports.append(p.device)
+    except ImportError:
+        pass
+    return ports
+
+
+def dxl_try(port, baud):
+    """port/baud 에서 다이나믹셀을 찾음. 찾으면 (PortHandler, ID, model), 못 찾으면 None"""
+    ph = PortHandler(port)
+    try:
+        if not ph.openPort():
+            return None
+    except Exception as e:
+        print(f"[DXL] {port} 열기 실패: {e}")
+        return None
+    if not ph.setBaudRate(baud):
+        ph.closePort()
+        return None
+    # 1) 설정된 ID 로 ping
+    model, res, _ = dxl_packet.ping(ph, DXL_ID)
+    if res == COMM_SUCCESS:
+        return ph, DXL_ID, model
+    # 2) broadcast ping 으로 아무 ID 나 (Protocol 2.0)
+    found, res = dxl_packet.broadcastPing(ph)
+    if res == COMM_SUCCESS and found:
+        dxl_id = sorted(found)[0]
+        return ph, dxl_id, found[dxl_id][0]
+    ph.closePort()
+    return None
+
+
 def dxl_init():
-    """포트만 열고 토크 OFF. 모터는 움직이지 않음."""
-    global dxl_port, dxl_packet, dxl_ok
+    """포트만 열고 토크 OFF. 모터는 움직이지 않음.
+    설정값(DXL_PORT / DXL_BAUD / DXL_ID)으로 안 되면 다른 포트/baud/ID 를 자동으로 찾음."""
+    global dxl_port, dxl_packet, dxl_ok, DXL_PORT, DXL_BAUD, DXL_ID
 
     if not DXL_SDK_OK:
         print("[DXL] dynamixel_sdk 가 없습니다:  pip install dynamixel-sdk")
         return
+
+    dxl_packet = PacketHandler(DXL_PROTOCOL)
+    if not os.path.exists(DXL_PORT):
+        print(f"[DXL] {DXL_PORT} 가 없습니다. U2D2 USB 연결 확인. 다른 포트를 찾아봅니다.")
+    elif not os.access(DXL_PORT, os.R_OK | os.W_OK):
+        print(f"[DXL] {DXL_PORT} 권한 없음:  sudo usermod -aG dialout $USER  후 재로그인")
+
+    result = None
     try:
-        dxl_port = PortHandler(DXL_PORT)
-        dxl_packet = PacketHandler(DXL_PROTOCOL)
-        if not dxl_port.openPort() or not dxl_port.setBaudRate(DXL_BAUD):
-            print(f"[DXL] 포트를 열 수 없습니다: {DXL_PORT}")
-            return
-        set_usb_low_latency()
-        res, err = dxl_packet.write1ByteTxRx(dxl_port, DXL_ID, ADDR_TORQUE_ENABLE, 0)
-        if res != COMM_SUCCESS:
-            print(f"[DXL] ID {DXL_ID} 응답 없음 (ID / Baudrate 확인)")
-            return
-        dxl_ok = True
-        print(f"[DXL] 연결됨: {DXL_PORT}, {DXL_BAUD} bps, ID {DXL_ID} (토크 OFF)")
+        # 먼저 설정값 그대로 시도
+        if os.path.exists(DXL_PORT):
+            result = dxl_try(DXL_PORT, DXL_BAUD)
+            if result:
+                port, baud = DXL_PORT, DXL_BAUD
+        # 안 되면 자동 검색
+        if not result:
+            print(f"[DXL] {DXL_PORT} / {DXL_BAUD} bps / ID {DXL_ID} 응답 없음 → 자동 검색 중...")
+            for port in dxl_candidate_ports():
+                if not os.path.exists(port):
+                    continue
+                for baud in DXL_SCAN_BAUDS:
+                    result = dxl_try(port, baud)
+                    if result:
+                        break
+                if result:
+                    break
     except Exception as e:
         print(f"[DXL] 초기화 실패: {e}")
+        result = None
+
+    if not result:
+        print("[DXL] 다이나믹셀을 찾지 못했습니다. 확인할 것:\n"
+              "      - 다이나믹셀 전원(12V) 이 켜져 있는지 (U2D2 USB 만으로는 전원이 안 들어감)\n"
+              "      - Dynamixel Wizard 등 다른 프로그램이 포트를 쓰고 있지 않은지\n"
+              "      - python3 check_connection.py 로 검색되는지")
+        return
+
+    dxl_port, found_id, model = result
+    if (port, baud, found_id) != (DXL_PORT, DXL_BAUD, DXL_ID):
+        print(f"[DXL] 설정과 다른 곳에서 찾음 → CONFIG 를 고쳐 두세요: "
+              f"DXL_PORT='{port}', DXL_BAUD={baud}, DXL_ID={found_id}")
+    DXL_PORT, DXL_BAUD, DXL_ID = port, baud, found_id
+
+    set_usb_low_latency()
+    res, err = dxl_packet.write1ByteTxRx(dxl_port, DXL_ID, ADDR_TORQUE_ENABLE, 0)
+    if res != COMM_SUCCESS:
+        print(f"[DXL] 토크 OFF 명령 실패: {dxl_packet.getTxRxResult(res)}")
+        dxl_port.closePort()
+        return
+    if err != 0:
+        # 하드웨어 에러(과부하 등) 상태면 재부팅해야 토크를 켤 수 있음
+        print(f"[DXL] 하드웨어 에러 상태: {dxl_packet.getRxPacketError(err)} → reboot 시도")
+        dxl_packet.reboot(dxl_port, DXL_ID)
+        time.sleep(1.0)
+    dxl_ok = True
+    print(f"[DXL] 연결됨: {DXL_PORT}, {DXL_BAUD} bps, ID {DXL_ID}, model {model} (토크 OFF)")
 
 
 def dxl_thread():
@@ -444,7 +598,9 @@ def close_gripper():
         return
     f = min(max(f, 0.0), CLOSE_FORCE_MAX)
 
-    send_force_value(f)
+    if not send_force_value(f):
+        set_status("CAN 전송 실패 - TSA 에 명령이 안 감 (CAN 상태 확인)", "red")
+        return
     phase = PHASE_CLOSE
     zero_ready = False
     set_status(f"1) Closing gripper: {f:.2f} N  →  다 오므려지면 [2. Zero Current]")
@@ -454,7 +610,9 @@ def close_gripper():
 def zero_current():
     """2단계: TSA 전류 0"""
     global phase, zero_ready
-    send_force_value(0.0)
+    if not send_force_value(0.0):
+        set_status("CAN 전송 실패 - TSA 전류 0 명령이 안 감 (CAN 상태 확인)", "red")
+        return
 
     if phase in (PHASE_PULL, PHASE_HOLD, PHASE_RETURN):
         return   # 당기는 도중에 눌렀으면 0 명령만 다시 보냄
@@ -570,8 +728,9 @@ def dxl_return():
 def tsa_return():
     """그리퍼 원위치 (기존 코드의 Return 과 동일한 CAN 메시지)"""
     global phase, zero_ready
-    msg = can.Message(arbitration_id=ID_TSA_CMD, data=b'return', is_extended_id=False)
-    bus.send(msg)
+    if not can_send(ID_TSA_CMD, b'return'):
+        set_status("CAN 전송 실패 - TSA Return 명령이 안 감 (CAN 상태 확인)", "red")
+        return
     phase = PHASE_IDLE
     zero_ready = False
     set_status("TSA RETURN Pos")
@@ -851,6 +1010,31 @@ def fmt(v, unit=""):
     return f"{v:10.3f} {unit}"
 
 
+def connection_text():
+    """연결 상태 진단 (오른쪽 패널 아래쪽)"""
+    now = time.time()
+
+    def alive(t):
+        return "OK" if now - t < 0.5 else "수신 없음"
+
+    if bus is None:
+        can_line = "CAN         : 연결 안 됨 (터미널 확인)\n"
+    else:
+        can_line = f"CAN state   : {can_state_text}\n"
+        if can_tx_errors:
+            can_line += f"CAN TX 실패 : {can_tx_errors} 회\n"
+    ids = sorted(can_rx_counts.items(), key=lambda kv: -kv[1])[:6]
+    id_text = ", ".join(f"0x{i:03X}" for i, _ in ids) if ids else "없음"
+    return (
+        "---- 연결 상태 ----\n"
+        + can_line
+        + f"CAN 수신 ID : {id_text}\n"
+        + f"FT 센서     : {alive(last_ft_time) if bus else '-'}\n"
+        + f"TSA 피드백  : {alive(last_tsa_time) if bus else '-'}\n"
+        + f"DXL         : {f'OK (ID {DXL_ID}, {DXL_PORT})' if dxl_ok else '연결 안 됨'}"
+    )
+
+
 def update_gui():
     """화면 갱신 (10 Hz): 상태 메시지, 버튼, 그래프, 텍스트"""
     global pending_status
@@ -897,7 +1081,7 @@ def update_gui():
             f"TSA Current : {fmt(cur, 'A')}\n\n"
             f"TSA Ref F   : {fmt(ref_f, 'N')}\n"
             f"TSA Out F   : {fmt(out_f, 'N')}\n\n"
-            f"DXL 연결    : {'OK' if dxl_ok else '연결 안 됨'}"
+            + connection_text()
         )
         if recording:
             canvas.draw_idle()
@@ -923,15 +1107,12 @@ def on_close():
         with dxl_lock:
             dxl_torque(False)
             dxl_port.closePort()
-    try:
-        bus.shutdown()
-    except Exception:
-        pass
-    if can_started_here:
+    if bus is not None:
         try:
-            cmd(f"sudo ip link set {CAN_CHANNEL} down")
-        except subprocess.CalledProcessError:
+            bus.shutdown()
+        except Exception:
             pass
+    # can0 는 끄지 않고 그대로 둠 → 다음 실행 때 sudo 없이 바로 사용 가능
     root.destroy()
     sys.exit(0)
 
@@ -940,10 +1121,17 @@ dxl_init()                             # 토크 OFF 상태로 연결만 함 (움
 if FT_ENABLE:
     ft_send_command(0x0B)              # FT 연속 출력 시작
 
-threading.Thread(target=can_rx_thread, daemon=True).start()
+if bus is not None:
+    threading.Thread(target=can_rx_thread, daemon=True).start()
+    threading.Thread(target=can_state_thread, daemon=True).start()
 if dxl_ok:
     threading.Thread(target=dxl_thread, daemon=True).start()
-else:
+
+if bus is None and not dxl_ok:
+    set_status("CAN, 다이나믹셀 모두 연결 안 됨 (터미널 메시지 확인)", "red")
+elif bus is None:
+    set_status("CAN 연결 안 됨 - TSA/FT 없이 다이나믹셀만 동작 (터미널 메시지 확인)", "orange")
+elif not dxl_ok:
     set_status("다이나믹셀 연결 안 됨 (터미널 메시지 확인) - TSA/FT 만 동작", "orange")
 
 threading.Thread(target=logger_thread, daemon=True).start()
